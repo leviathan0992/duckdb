@@ -50,72 +50,40 @@ struct ReadHead {
 	}
 };
 
-// Comparator for ReadHeads that are either overlapping, adjacent, or within ALLOW_GAP bytes from each other
-struct ReadHeadComparator {
-	static constexpr uint64_t ALLOW_GAP = 1 << 14; // 16 KiB
-	bool operator()(const ReadHead *a, const ReadHead *b) const {
-		auto a_start = a->location;
-		auto a_end = a->location + a->size;
-		auto b_start = b->location;
+static constexpr uint64_t READ_HEAD_MERGE_GAP = 1 << 14; // 16 KiB
 
-		if (a_end <= NumericLimits<idx_t>::Maximum() - ALLOW_GAP) {
-			a_end += ALLOW_GAP;
-		}
-
-		return a_start < b_start && a_end < b_start;
-	}
-};
-
-// Two-step read ahead buffer
-// 1: register all ranges that will be read, merging ranges that are consecutive
-// 2: prefetch all registered ranges
+// Read ahead buffer
+// 1: register all ranges that will be read
+// 2: keep mergeable ranges pending during registration
+// 3: finalize by sorting and coalescing pending ranges
+// 4: prefetch finalized ranges
 struct ReadAheadBuffer {
 	explicit ReadAheadBuffer(CachingFileHandle &file_handle_p) : file_handle(file_handle_p) {
 	}
 
-	// The list of read heads
+	// Finalized read heads ready for lookup and prefetch.
 	std::list<ReadHead> read_heads;
-	// Set for merging consecutive ranges
-	std::set<ReadHead *, ReadHeadComparator> merge_set;
+
+	// Pending mergeable read heads collected during registration.
+	std::list<ReadHead> merge_read_heads;
 
 	CachingFileHandle &file_handle;
 
-	idx_t total_size = 0;
-
 	// Add a read head to the prefetching list
-	void AddReadHead(idx_t pos, uint64_t len, bool merge_buffers = true) {
-		// Attempt to merge with existing
-		if (merge_buffers) {
-			ReadHead new_read_head {pos, len};
-			auto lookup_set = merge_set.find(&new_read_head);
-			if (lookup_set != merge_set.end()) {
-				auto existing_head = *lookup_set;
-				auto new_start = MinValue<idx_t>(existing_head->location, new_read_head.location);
-				auto new_length = MaxValue<idx_t>(existing_head->GetEnd(), new_read_head.GetEnd()) - new_start;
-				existing_head->location = new_start;
-				existing_head->size = new_length;
-				return;
-			}
-		}
+	void AddReadHead(idx_t pos, uint64_t len, bool can_merge = true) {
+		ValidateRange(pos, len);
 
-		read_heads.emplace_front(ReadHead(pos, len));
-		total_size += len;
-		auto &read_head = read_heads.front();
-
-		if (merge_buffers) {
-			merge_set.insert(&read_head);
-		}
-
-		if (read_head.GetEnd() > file_handle.GetFileSize()) {
-			throw std::runtime_error("Prefetch registered for bytes outside file: " + file_handle.GetPath() +
-			                         ", attempted range: [" + std::to_string(pos) + ", " +
-			                         std::to_string(read_head.GetEnd()) +
-			                         "), file size: " + std::to_string(file_handle.GetFileSize()));
+		if (can_merge) {
+			merge_read_heads.emplace_front(pos, len);
+		} else {
+			read_heads.emplace_front(pos, len);
 		}
 	}
 
 	// Returns the relevant read head
 	ReadHead *GetReadHead(idx_t pos) {
+		FinalizeRegistration();
+
 		for (auto &read_head : read_heads) {
 			if (pos >= read_head.location && pos < read_head.GetEnd()) {
 				return &read_head;
@@ -126,13 +94,71 @@ struct ReadAheadBuffer {
 
 	// Prefetch all read heads
 	void Prefetch() {
+		FinalizeRegistration();
+
 		for (auto &read_head : read_heads) {
-			if (read_head.GetEnd() > file_handle.GetFileSize()) {
-				throw std::runtime_error("Prefetch registered requested for bytes outside file");
+			if (read_head.data_isset) {
+				continue;
 			}
 			read_head.handle_group = file_handle.Read(read_head.size, read_head.location);
 			read_head.Materialize();
 			read_head.data_isset = true;
+		}
+	}
+
+	// Merge pending read heads and move them to the finalized list.
+	void FinalizeRegistration() {
+		if (merge_read_heads.empty()) {
+			return;
+		}
+
+		// Sort by start offset so the following adjacent scan can coalesce cascading ranges.
+		merge_read_heads.sort(
+		    [](const ReadHead &left, const ReadHead &right) { return left.location < right.location; });
+
+		// Walk adjacent ranges and keep extending the current range while the next one can be merged into it.
+		auto current = merge_read_heads.begin();
+		auto next = current;
+		++next;
+		while (next != merge_read_heads.end()) {
+			D_ASSERT(current->location <= next->location);
+
+			if (current->GetEnd() >= next->location || next->location - current->GetEnd() <= READ_HEAD_MERGE_GAP) {
+				// Merge overlapping, adjacent, or nearby ranges into current.
+				auto new_end = MaxValue<idx_t>(current->GetEnd(), next->GetEnd());
+				current->size = new_end - current->location;
+				next = merge_read_heads.erase(next);
+			} else {
+				current = next;
+				++next;
+			}
+		}
+
+		read_heads.splice(read_heads.begin(), merge_read_heads);
+	}
+
+	// Drop both finalized and pending read heads.
+	void Clear() {
+		read_heads.clear();
+		merge_read_heads.clear();
+	}
+
+	// Pending read heads also count as prefetch state.
+	bool HasPrefetch() const {
+		return !read_heads.empty() || !merge_read_heads.empty();
+	}
+
+private:
+	// Reject ranges outside the file before they enter either read-head list.
+	void ValidateRange(idx_t pos, uint64_t len) {
+		auto file_size = file_handle.GetFileSize();
+
+		if (pos > file_size || len > file_size - pos) {
+			auto end = len > NumericLimits<idx_t>::Maximum() - pos ? string("overflow") : std::to_string(pos + len);
+
+			throw std::runtime_error("Prefetch registered for bytes outside file: " + file_handle.GetPath() +
+			                         ", attempted range: [" + std::to_string(pos) + ", " + end +
+			                         "), file size: " + std::to_string(file_size));
 		}
 	}
 };
@@ -178,14 +204,14 @@ public:
 		PrefetchRegistered();
 	}
 
-	// Register a buffer for prefixing
+	// Register a buffer for prefetching
 	void RegisterPrefetch(idx_t pos, uint64_t len, bool can_merge = true) {
 		ra_buffer.AddReadHead(pos, len, can_merge);
 	}
 
-	// Prevents any further merges, should be called before PrefetchRegistered
+	// Finalizes mergeable read heads, should be called before PrefetchRegistered
 	void FinalizeRegistration() {
-		ra_buffer.merge_set.clear();
+		ra_buffer.FinalizeRegistration();
 	}
 
 	// Prefetch all previously registered ranges
@@ -194,8 +220,7 @@ public:
 	}
 
 	void ClearPrefetch() {
-		ra_buffer.read_heads.clear();
-		ra_buffer.merge_set.clear();
+		ra_buffer.Clear();
 	}
 
 	void Skip(idx_t skip_count) {
@@ -203,7 +228,7 @@ public:
 	}
 
 	bool HasPrefetch() const {
-		return !ra_buffer.read_heads.empty() || !ra_buffer.merge_set.empty();
+		return ra_buffer.HasPrefetch();
 	}
 
 	void SetLocation(idx_t location_p) {
